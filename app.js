@@ -1566,10 +1566,7 @@ async function init() {
 
     const topStatsSelect = document.getElementById("topStatsSourceSelect");
     const strategySelect = document.getElementById("strategySelect");
-    const blendStrategyPicker = document.getElementById("blendStrategyPicker");
-    const blendStrategyCheckboxes = Array.from(
-      document.querySelectorAll('input[name="blendStrategy"]')
-    );
+    const blendStrategyCheckboxes = [];
     const assetFilterSelect = document.getElementById("assetFilterSelect");
     const initialCapitalInput = document.getElementById("initialCapitalInput");
     const startDateInput = document.getElementById("startDateInput");
@@ -1580,10 +1577,6 @@ async function init() {
     if (initialCapitalInput) initialCapitalInput.value = String(currentInitialCapital);
     if (startDateInput && isIsoDate(currentStartDateIso)) startDateInput.value = currentStartDateIso;
     if (equityModeSelect) equityModeSelect.value = currentEquityMode;
-    blendStrategyCheckboxes.forEach((checkbox) => {
-      checkbox.checked = currentBlendStrategyIds.includes(checkbox.value);
-    });
-
     let active = null;
     let topSources = null;
 
@@ -1608,9 +1601,7 @@ async function init() {
       const nextAssetFilter = String(assetFilterSelect?.value || "both").toLowerCase();
       const nextStartDate = String(startDateInput?.value || "").trim();
       const nextEquityMode = String(equityModeSelect?.value || "reset_each_year");
-      let nextBlendIds = blendStrategyCheckboxes
-        .filter((checkbox) => checkbox.checked)
-        .map((checkbox) => checkbox.value);
+      let nextBlendIds = backtestDatasets.map((dataset) => dataset.id);
       currentInitialCapital = Number.isFinite(nextInitial) && nextInitial > 0 ? nextInitial : DEFAULT_STARTING_EQUITY;
       currentAssetFilter = ["both", "mnq", "mes"].includes(nextAssetFilter) ? nextAssetFilter : "both";
       currentStrategyId = String(strategySelect?.value || backtestDatasets[0]?.id || currentStrategyId);
@@ -1622,9 +1613,6 @@ async function init() {
       nextBlendIds = nextBlendIds.filter((id) => availableBlendIds.includes(id));
       if (!nextBlendIds.length) nextBlendIds = [...availableBlendIds];
       currentBlendStrategyIds = nextBlendIds;
-      blendStrategyCheckboxes.forEach((checkbox) => {
-        checkbox.checked = currentBlendStrategyIds.includes(checkbox.value);
-      });
       let backtests = computeBacktestsFromDatasets(
         backtestDatasets,
         currentInitialCapital,
@@ -1654,9 +1642,6 @@ async function init() {
       if (initialCapitalInput) initialCapitalInput.value = String(Math.round(currentInitialCapital * 100) / 100);
       if (startDateInput && isIsoDate(currentStartDateIso)) startDateInput.value = currentStartDateIso;
       if (equityModeSelect) equityModeSelect.value = currentEquityMode;
-      if (blendStrategyPicker) {
-        blendStrategyPicker.style.display = currentStrategyId === "blend_selected" ? "inline-flex" : "none";
-      }
       active = backtests.find((b) => b.id === currentStrategyId) || backtests[0];
       topSources = { backtest: active };
       tradeLogCurrentPage = 1;
@@ -1688,14 +1673,6 @@ async function init() {
         if (selectedSource) renderPeriodicalReturns(selectedSource);
       };
     }
-    blendStrategyCheckboxes.forEach((checkbox) => {
-      checkbox.onchange = () => {
-        if (strategySelect) strategySelect.value = "blend_selected";
-        currentStrategyId = "blend_selected";
-        applySizing();
-      };
-    });
-
     applySizing();
 
     if (topStatsSelect) {
