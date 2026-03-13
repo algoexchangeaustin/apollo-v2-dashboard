@@ -1,0 +1,1778 @@
+const DEFAULT_STARTING_EQUITY = 10000;
+const DEFAULT_BET_SIZE = 100;
+const PERFORMANCE_START_ISO = "";
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const TRADE_LOG_PAGE_SIZE = 25;
+
+const SIZING_PROFILES = {
+  "2ct": [
+    {
+      id: "mnq_swing_bo",
+      label: "MNQ Swing BO 2hr (2ct)",
+      file: "./reports/Swing BO 15min MNQ 2018.csv",
+      format: "tradestation",
+      defaultInstrument: "MNQ",
+      pnlColumns: ["Profit", "new_total_pnl_usd", "pnl_usd_100", "base_pnl_usd"]
+    },
+    {
+      id: "mes_tango",
+      label: "MES Tango 15min (2ct)",
+      file: "./reports/MES Tango 15 min 2018.csv",
+      format: "tradestation",
+      defaultInstrument: "MES",
+      pnlColumns: ["Profit", "new_total_pnl_usd", "pnl_usd_100", "base_pnl_usd"]
+    }
+  ],
+  "1ct": [
+    {
+      id: "mnq_swing_bo",
+      label: "MNQ Swing BO 2hr (1ct)",
+      file: "./reports/SwingBO 2hr 1 MNQ 2018.csv",
+      format: "tradestation",
+      defaultInstrument: "MNQ",
+      pnlColumns: ["Profit", "new_total_pnl_usd", "pnl_usd_100", "base_pnl_usd"]
+    },
+    {
+      id: "mes_tango",
+      label: "MES Tango 15min (1ct)",
+      file: "./reports/Tango 1 MES 2018.csv",
+      format: "tradestation",
+      defaultInstrument: "MES",
+      pnlColumns: ["Profit", "new_total_pnl_usd", "pnl_usd_100", "base_pnl_usd"]
+    }
+  ]
+};
+
+let currentSizingProfile = "1ct";
+let BACKTEST_STRATEGIES = SIZING_PROFILES[currentSizingProfile];
+
+const MC_FILES = {
+  stats: "./reports/nt_mc_stats.csv",
+  paths: "./reports/nt_mc_trade_paths.csv",
+  percentiles: "./reports/nt_mc_equity_percentiles.csv"
+};
+
+let equityChartRef = null;
+let mcPathChartRef = null;
+let tradeLogCurrentPage = 1;
+let currentInitialCapital = DEFAULT_STARTING_EQUITY;
+let currentBetSize = DEFAULT_BET_SIZE;
+let currentAssetFilter = "both";
+let currentStrategyId = "blend_selected";
+let currentStartDateIso = "";
+let currentBlendStrategyIds = BACKTEST_STRATEGIES.map((s) => s.id);
+let currentEquityMode = "reset_each_year";
+
+function parseCsv(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const headerIdx = lines.findIndex((line) => {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) return false;
+    if (!trimmed.includes(",")) return false;
+    if (trimmed.toLowerCase() === "tradestation trades list") return false;
+    return true;
+  });
+  if (headerIdx < 0) return [];
+  const headers = lines[headerIdx].split(",").map((h) => String(h || "").trim());
+  return lines.slice(headerIdx + 1).map((line) => {
+    if (!String(line || "").trim()) return null;
+    const values = line.split(",");
+    const row = {};
+    headers.forEach((key, index) => {
+      row[key] = String(values[index] ?? "").trim();
+    });
+    return row;
+  }).filter(Boolean);
+}
+
+function toNumber(value) {
+  if (value === undefined || value === null || value === "") return NaN;
+  if (typeof value === "number") return Number.isFinite(value) ? value : NaN;
+  let normalized = String(value).trim();
+  if (!normalized) return NaN;
+  const isParenNegative = /^\(.*\)$/.test(normalized);
+  normalized = normalized.replace(/[,$]/g, "").replace(/\$/g, "");
+  if (isParenNegative) normalized = `-${normalized.slice(1, -1)}`;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function toBool(value) {
+  if (typeof value === "boolean") return value;
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "true" || normalized === "1" || normalized === "yes";
+}
+
+function fmtCurrency(value) {
+  if (!Number.isFinite(value)) return "-";
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 2
+  }).format(value);
+}
+
+function fmtPercent(value, digits = 2) {
+  if (!Number.isFinite(value)) return "-";
+  return `${value.toFixed(digits)}%`;
+}
+
+function fmtNumber(value, digits = 2) {
+  if (!Number.isFinite(value)) return "-";
+  return value.toFixed(digits);
+}
+
+function setTextById(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = value;
+}
+
+function dayDiffIso(startIso, endIso) {
+  const start = parseIsoAsUtcDate(startIso);
+  const end = parseIsoAsUtcDate(endIso);
+  if (!start || !end) return NaN;
+  return Math.max(Math.round((end.getTime() - start.getTime()) / 86400000), 0);
+}
+
+function toIsoDateString(date) {
+  if (!(date instanceof Date) || !Number.isFinite(date.getTime())) return "";
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(date.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function parseUtcTimestamp(value) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  // First attempt native parsing (handles NinjaTrader's M/D/YYYY h:mm:ss AM/PM).
+  const direct = new Date(raw);
+  if (Number.isFinite(direct.getTime())) return direct;
+
+  // Fallback for ISO-like values that use a space between date/time.
+  const normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
+  const parsed = new Date(normalized);
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+function rowDateIso(row) {
+  const raw = row.market_end_time_utc || row.entry_time_utc || row["Exit time"] || row["Entry time"];
+  const parsed = parseUtcTimestamp(raw);
+  return parsed ? toIsoDateString(parsed) : "";
+}
+
+function formatTradeDateTime(rawValue) {
+  const parsed = parseUtcTimestamp(rawValue);
+  if (!parsed) return String(rawValue || "-");
+  return parsed.toLocaleString("en-US", {
+    year: "2-digit",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: false
+  }).replace(",", "");
+}
+
+function formatDescription(row) {
+  const instrument = String(row.Instrument || row.instrument || "").trim().toUpperCase();
+  if (instrument.startsWith("MNQ")) return "MICRO E-MINI NASDAQ 100";
+  if (instrument.startsWith("NQ")) return "E-MINI NASDAQ 100";
+  if (instrument.startsWith("MES")) return "MICRO E-MINI S&P 500";
+  if (instrument.startsWith("ES")) return "E-MINI S&P 500";
+  return instrument || "UNKNOWN";
+}
+
+function computeDrawdownPctFromRow(row, qtyTraded, entryPrice) {
+  const mae = toNumber(row.MAE ?? row.mae);
+  if (!Number.isFinite(mae) || mae <= 0) return NaN;
+  const qty = Number.isFinite(qtyTraded) && qtyTraded > 0 ? qtyTraded : NaN;
+  const px = Number.isFinite(entryPrice) && entryPrice > 0 ? entryPrice : NaN;
+  if (!Number.isFinite(qty) || !Number.isFinite(px)) return NaN;
+  const notional = qty * px;
+  if (!Number.isFinite(notional) || notional <= 0) return NaN;
+  return (mae / notional) * 100;
+}
+
+function firstValidDateIso(rows) {
+  const dates = (Array.isArray(rows) ? rows : [])
+    .map((row) => rowDateIso(row))
+    .filter((iso) => /^\d{4}-\d{2}-\d{2}$/.test(iso))
+    .sort();
+  return dates[0] || "";
+}
+
+function isIsoDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
+}
+
+function normalizeTradeStationRows(rows, fallbackInstrument = "MNQ") {
+  const normalized = [];
+  let openTrade = null;
+  let prevCumNet = NaN;
+  const parseCumNet = (row) => toNumber(row["Net Profit - Cum Net Profit"]);
+  const parseTradePnl = (row) => toNumber(row["Shares/Ctrts - Profit/Loss"]);
+
+  const finalizeOpenTrade = () => {
+    if (!openTrade) return;
+    if (!Number.isFinite(toNumber(openTrade.Profit))) return;
+    normalized.push(openTrade);
+    openTrade = null;
+  };
+
+  rows.forEach((row) => {
+    const type = String(row.Type || "").trim();
+    const dateTime = String(row["Date/Time"] || "").trim();
+    const price = toNumber(row.Price);
+    const qtyOrPnl = toNumber(row["Shares/Ctrts - Profit/Loss"]);
+    const cumNet = parseCumNet(row);
+    const isEntry = type === "Buy" || type === "Sell Short";
+    const isExit = type === "Sell" || type === "Buy to Cover";
+
+    if (isEntry) {
+      finalizeOpenTrade();
+      openTrade = {
+        Instrument: fallbackInstrument,
+        "Market pos.": type === "Buy" ? "Long" : "Short",
+        Qty: Number.isFinite(qtyOrPnl) && qtyOrPnl > 0 ? qtyOrPnl : 1,
+        "Entry price": price,
+        "Exit price": price,
+        "Entry time": dateTime,
+        "Exit time": dateTime,
+        Profit: NaN
+      };
+      if (Number.isFinite(cumNet)) prevCumNet = cumNet;
+      return;
+    }
+
+    if (isExit) {
+      let tradePnl = parseTradePnl(row);
+      if (!Number.isFinite(tradePnl) && Number.isFinite(cumNet)) {
+        tradePnl = Number.isFinite(prevCumNet) ? (cumNet - prevCumNet) : cumNet;
+      }
+      if (!openTrade) {
+        openTrade = {
+          Instrument: fallbackInstrument,
+          "Market pos.": type === "Buy to Cover" ? "Short" : "Long",
+          Qty: 1,
+          "Entry price": price,
+          "Exit price": price,
+          "Entry time": dateTime,
+          "Exit time": dateTime,
+          Profit: Number.isFinite(tradePnl) ? tradePnl : NaN
+        };
+      } else {
+        if (Number.isFinite(price)) openTrade["Exit price"] = price;
+        if (dateTime) openTrade["Exit time"] = dateTime;
+        if (Number.isFinite(tradePnl)) openTrade.Profit = tradePnl;
+      }
+      if (Number.isFinite(cumNet)) prevCumNet = cumNet;
+      finalizeOpenTrade();
+    }
+  });
+
+  finalizeOpenTrade();
+  return normalized;
+}
+
+function getPerformanceWindow() {
+  const startDate = new Date(`${PERFORMANCE_START_ISO}T00:00:00Z`);
+  const now = new Date();
+  const endDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59));
+  return { startDate, endDate };
+}
+
+async function fetchCsv(path) {
+  const response = await fetch(path, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch ${path}: HTTP ${response.status}`);
+  }
+  return parseCsv(await response.text());
+}
+
+function monthKeyFromUtc(value) {
+  if (!value) return "";
+  return String(value).slice(0, 7);
+}
+
+function formatMarketTraded(row) {
+  const instrument = String(row.Instrument || row.instrument || "").trim().toUpperCase();
+  const asset = String(row.asset || instrument || "").trim().toUpperCase();
+  const rawDate = row.market_end_time_utc || row.entry_time_utc || row["Exit time"] || row["Entry time"];
+  const parsed = rawDate ? new Date(rawDate) : null;
+  const prettyDate = parsed && Number.isFinite(parsed.getTime())
+    ? parsed.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" })
+    : String(rawDate || "").slice(0, 10);
+  if (asset && prettyDate) return `${asset} Up or Down on ${prettyDate}`;
+  return row.slug || instrument || `${asset} ${row.market_id || ""}`.trim() || "Unknown";
+}
+
+function formatSymbol(row) {
+  const instrument = String(row.Instrument || row.instrument || "").trim().toUpperCase();
+  if (instrument) return instrument.split(" ")[0] || instrument;
+  const asset = String(row.asset || "").trim().toUpperCase();
+  return asset || "MNQ";
+}
+
+function computeCagr(periodStart, periodEnd, endingEquity, startingEquity = DEFAULT_STARTING_EQUITY) {
+  const startTs = new Date(periodStart).getTime();
+  const endTs = new Date(periodEnd).getTime();
+  const days = Number.isFinite(startTs) && Number.isFinite(endTs) ? Math.max((endTs - startTs) / 86400000, 1) : 1;
+  const growth = endingEquity / startingEquity;
+  if (!Number.isFinite(growth) || growth <= 0) return NaN;
+  return (Math.pow(growth, 365 / days) - 1) * 100;
+}
+
+function computeCagrFromEquity(periodStart, periodEnd, startEquity, endEquity) {
+  const startTs = new Date(periodStart).getTime();
+  const endTs = new Date(periodEnd).getTime();
+  const days = Number.isFinite(startTs) && Number.isFinite(endTs) ? Math.max((endTs - startTs) / 86400000, 1) : 1;
+  const growth = startEquity > 0 ? endEquity / startEquity : NaN;
+  if (!Number.isFinite(growth) || growth <= 0) return NaN;
+  return (Math.pow(growth, 365 / days) - 1) * 100;
+}
+
+function computeDisplayRateOfReturn(periodStart, periodEnd, startEquity, endEquity) {
+  const startTs = new Date(periodStart).getTime();
+  const endTs = new Date(periodEnd).getTime();
+  const days = Number.isFinite(startTs) && Number.isFinite(endTs) ? Math.max((endTs - startTs) / 86400000, 1) : 1;
+  if (!Number.isFinite(startEquity) || !Number.isFinite(endEquity) || startEquity <= 0) {
+    return { label: "Rate of Return", valuePct: NaN };
+  }
+
+  if (days < 365) {
+    const cumulativePct = ((endEquity - startEquity) / startEquity) * 100;
+    return { label: "Cumulative Return", valuePct: cumulativePct };
+  }
+
+  const ageInYears = days / 365;
+  const annualizedPct = (Math.pow(endEquity / startEquity, 1 / ageInYears) - 1) * 100;
+  return { label: "Annualized Return (Compounded)", valuePct: annualizedPct };
+}
+
+function computeAverageAnnualReturnBasedOnInitial(tradeLog, startingEquity) {
+  if (!Number.isFinite(startingEquity) || startingEquity <= 0) return NaN;
+  const pnlByYear = new Map();
+  (Array.isArray(tradeLog) ? tradeLog : []).forEach((trade) => {
+    const date = String(trade?.date || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return;
+    const year = date.slice(0, 4);
+    const pnl = toNumber(trade?.pnlUsd);
+    if (!Number.isFinite(pnl)) return;
+    pnlByYear.set(year, (pnlByYear.get(year) || 0) + pnl);
+  });
+  const yearlyReturns = [...pnlByYear.values()].map((yearPnl) => (yearPnl / startingEquity) * 100);
+  if (!yearlyReturns.length) return NaN;
+  return yearlyReturns.reduce((acc, v) => acc + v, 0) / yearlyReturns.length;
+}
+
+function computeScaledTradeFromRow(row, pnlColumn, targetBetSize) {
+  const ntProfit = toNumber(row.Profit);
+  if (Number.isFinite(ntProfit)) {
+    const qty = toNumber(row.Qty);
+    const safeQty = Number.isFinite(qty) && qty > 0 ? qty : 1;
+    const entryPrice = toNumber(row["Entry price"]);
+    return {
+      pnlUsd: ntProfit,
+      totalStakeUsd: targetBetSize * safeQty,
+      entryPrice,
+      qtyTraded: safeQty
+    };
+  }
+
+  const addFraction = 0.2;
+  const baseTargetStake = targetBetSize;
+  const add1230Triggered = toBool(row.add20_1230_triggered);
+  const add1430Triggered = toBool(row.add20_1430_triggered);
+  const add1230TargetStake = add1230Triggered ? targetBetSize * addFraction : 0;
+  const add1430TargetStake = add1430Triggered ? targetBetSize * addFraction : 0;
+
+  const rawBaseStake = toNumber(row.base_stake_usd ?? row.stake_usd);
+  const rawAdd1230Stake = toNumber(row.add20_1230_stake_usd);
+  const rawAdd1430Stake = toNumber(row.add20_1430_stake_usd);
+  const rawBasePnl = toNumber(row.base_pnl_usd);
+  const rawAdd1230Pnl = toNumber(row.add20_1230_pnl_usd);
+  const rawAdd1430Pnl = toNumber(row.add20_1430_pnl_usd);
+  let scaledPnl = 0;
+  let usedLegScaling = false;
+
+  if (Number.isFinite(rawBasePnl) && Number.isFinite(rawBaseStake) && rawBaseStake > 0) {
+    scaledPnl += rawBasePnl * (baseTargetStake / rawBaseStake);
+    usedLegScaling = true;
+  }
+
+  if (add1230Triggered && Number.isFinite(rawAdd1230Pnl) && Number.isFinite(rawAdd1230Stake) && rawAdd1230Stake > 0) {
+    scaledPnl += rawAdd1230Pnl * (add1230TargetStake / rawAdd1230Stake);
+    usedLegScaling = true;
+  }
+
+  if (add1430Triggered && Number.isFinite(rawAdd1430Pnl) && Number.isFinite(rawAdd1430Stake) && rawAdd1430Stake > 0) {
+    scaledPnl += rawAdd1430Pnl * (add1430TargetStake / rawAdd1430Stake);
+    usedLegScaling = true;
+  }
+
+  if (!usedLegScaling) {
+    const rawPnl = toNumber(row[pnlColumn]);
+    const rawStake = toNumber(row.new_total_stake_usd ?? row.base_stake_usd ?? row.stake_usd);
+    const scale = Number.isFinite(rawStake) && rawStake > 0 ? (baseTargetStake / rawStake) : (baseTargetStake / DEFAULT_BET_SIZE);
+    scaledPnl = Number.isFinite(rawPnl) ? rawPnl * scale : NaN;
+  }
+
+  const targetTotalStake = baseTargetStake + add1230TargetStake + add1430TargetStake;
+  const baseEntry = toNumber(row.entry_price);
+  const add1230Entry = toNumber(row.add20_1230_entry_price);
+  const add1430Entry = toNumber(row.add20_1430_entry_price);
+  let weightedPriceSum = 0;
+  let weightedStakeSum = 0;
+  if (baseTargetStake > 0 && Number.isFinite(baseEntry)) {
+    weightedPriceSum += baseEntry * baseTargetStake;
+    weightedStakeSum += baseTargetStake;
+  }
+  if (add1230TargetStake > 0 && Number.isFinite(add1230Entry)) {
+    weightedPriceSum += add1230Entry * add1230TargetStake;
+    weightedStakeSum += add1230TargetStake;
+  }
+  if (add1430TargetStake > 0 && Number.isFinite(add1430Entry)) {
+    weightedPriceSum += add1430Entry * add1430TargetStake;
+    weightedStakeSum += add1430TargetStake;
+  }
+
+  return {
+    pnlUsd: scaledPnl,
+    totalStakeUsd: targetTotalStake,
+    entryPrice: weightedStakeSum > 0 ? (weightedPriceSum / weightedStakeSum) : baseEntry,
+    qtyTraded: targetBetSize > 0 ? (targetTotalStake / targetBetSize) : NaN
+  };
+}
+
+function computeBacktestMetrics(
+  label,
+  rows,
+  pnlColumn,
+  startingEquity = DEFAULT_STARTING_EQUITY,
+  targetBetSize = DEFAULT_BET_SIZE,
+  startDateIso = "",
+  resetEachYear = true
+) {
+  const { endDate: windowEnd } = getPerformanceWindow();
+  const datasetStartIso = firstValidDateIso(rows) || PERFORMANCE_START_ISO;
+  const windowStartIso = isIsoDate(startDateIso) ? startDateIso : datasetStartIso;
+  const windowEndIso = toIsoDateString(windowEnd);
+  const extractIsoDate = (row) => rowDateIso(row);
+  const sorted = [...rows].sort((a, b) => {
+    const aDate = extractIsoDate(a);
+    const bDate = extractIsoDate(b);
+    if (aDate !== bDate) return String(aDate).localeCompare(String(bDate));
+    return String(a.asset).localeCompare(String(b.asset));
+  });
+  const bounded = sorted.filter((row) => {
+    const isoDate = extractIsoDate(row);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) return false;
+    return isoDate >= windowStartIso && isoDate <= windowEndIso;
+  });
+
+  let runningEquity = startingEquity;
+  let maxEquity = startingEquity;
+  let maxDrawdownUsd = 0;
+  let maxDrawdownPct = 0;
+  let peakEquityForDd = startingEquity;
+  let peakDateForDd = datasetStartIso;
+  let runningEquityCumulative = startingEquity;
+  let maxDdStartDate = "";
+  let maxDdEndDate = "";
+  let maxDdDurationDays = NaN;
+  let wins = 0;
+  let losses = 0;
+  let grossProfit = 0;
+  let grossLossAbs = 0;
+  const equity = [];
+  const equityCumulative = [];
+  const labels = [];
+  const drawdownPctSeries = [];
+  const monthlyReturns = [];
+  const addTriggerPattern = [];
+
+  let currentMonth = "";
+  let monthStartEquity = startingEquity;
+  let monthPnl = 0;
+  let currentCalendarYear = "";
+
+  bounded.forEach((row, idx) => {
+    const rowIsoDate = extractIsoDate(row);
+    const rowYear = /^\d{4}-\d{2}-\d{2}$/.test(rowIsoDate) ? rowIsoDate.slice(0, 4) : "";
+    if (resetEachYear && rowYear && currentCalendarYear && rowYear !== currentCalendarYear) {
+      // Reset annual equity baseline to the configured initial capital.
+      runningEquity = startingEquity;
+      maxEquity = startingEquity;
+      peakEquityForDd = startingEquity;
+      peakDateForDd = `${rowYear}-01-01`;
+    }
+    if (rowYear) currentCalendarYear = rowYear;
+
+    const scaledTrade = computeScaledTradeFromRow(row, pnlColumn, targetBetSize);
+    const pnl = scaledTrade.pnlUsd;
+    if (!Number.isFinite(pnl)) return;
+    addTriggerPattern.push({
+      add1230: toBool(row.add20_1230_triggered),
+      add1430: toBool(row.add20_1430_triggered)
+    });
+
+    const monthKey = String(rowDateIso(row) || "").slice(0, 7);
+    if (!currentMonth) {
+      currentMonth = monthKey;
+      monthStartEquity = runningEquity;
+    } else if (monthKey !== currentMonth) {
+      monthlyReturns.push({
+        monthKey: currentMonth,
+        startEquity: monthStartEquity,
+        pnl: monthPnl,
+        returnPct: monthStartEquity !== 0 ? (monthPnl / monthStartEquity) * 100 : NaN
+      });
+      currentMonth = monthKey;
+      monthStartEquity = runningEquity;
+      monthPnl = 0;
+    }
+
+    monthPnl += pnl;
+    runningEquity += pnl;
+    runningEquityCumulative += pnl;
+    maxEquity = Math.max(maxEquity, runningEquity);
+    if (runningEquity >= peakEquityForDd) {
+      peakEquityForDd = runningEquity;
+      peakDateForDd = rowIsoDate || peakDateForDd;
+    }
+    const drawdownUsd = maxEquity - runningEquity;
+    maxDrawdownUsd = Math.max(maxDrawdownUsd, drawdownUsd);
+    const drawdownPctAbs = peakEquityForDd > 0 ? (drawdownUsd / peakEquityForDd) * 100 : 0;
+    if (drawdownPctAbs > maxDrawdownPct) {
+      maxDrawdownPct = drawdownPctAbs;
+      maxDrawdownUsd = drawdownUsd;
+      maxDdStartDate = peakDateForDd;
+      maxDdEndDate = rowIsoDate;
+      maxDdDurationDays = dayDiffIso(maxDdStartDate, maxDdEndDate);
+    }
+    const drawdownPct = -drawdownPctAbs;
+
+    if (pnl >= 0) {
+      wins += 1;
+      grossProfit += pnl;
+    } else {
+      losses += 1;
+      grossLossAbs += Math.abs(pnl);
+    }
+
+    labels.push(rowDateIso(row) || `T${idx + 1}`);
+    equity.push(runningEquity);
+    equityCumulative.push(runningEquityCumulative);
+    drawdownPctSeries.push(drawdownPct);
+  });
+
+  if (currentMonth) {
+    monthlyReturns.push({
+      monthKey: currentMonth,
+      startEquity: monthStartEquity,
+      pnl: monthPnl,
+      returnPct: monthStartEquity !== 0 ? (monthPnl / monthStartEquity) * 100 : NaN
+    });
+  }
+
+  const trades = wins + losses;
+  const netPnl = grossProfit - grossLossAbs;
+  const profitFactor = grossLossAbs > 0 ? grossProfit / grossLossAbs : NaN;
+  const winRatePct = trades > 0 ? (wins / trades) * 100 : NaN;
+  const endingEquity = equity.length ? equity[equity.length - 1] : startingEquity;
+  const cagrPct = computeCagr(
+    bounded[0] ? extractIsoDate(bounded[0]) : windowStartIso,
+    bounded[bounded.length - 1] ? extractIsoDate(bounded[bounded.length - 1]) : windowEndIso,
+    endingEquity,
+    startingEquity
+  );
+  const tradeLog = [...bounded]
+    .map((row) => {
+      const scaledTrade = computeScaledTradeFromRow(row, pnlColumn, targetBetSize);
+      const pnl = scaledTrade.pnlUsd;
+      const signal = String(row.signal || row["Market pos."] || "").trim();
+      const resolved = String(row.resolved_label || "").trim();
+      let result = "Open";
+      if (resolved && signal) result = resolved.toLowerCase() === signal.toLowerCase() ? "Win" : "Loss";
+      else if (Number.isFinite(pnl)) result = pnl >= 0 ? "Win" : "Loss";
+
+      return {
+        date: rowDateIso(row),
+        entryTs: parseUtcTimestamp(row["Entry time"] || row.entry_time_utc)?.getTime() || NaN,
+        entryTime: formatTradeDateTime(row["Entry time"] || row.entry_time_utc),
+        exitTime: formatTradeDateTime(row["Exit time"] || row.market_end_time_utc || row.entry_time_utc),
+        market: formatSymbol(row),
+        description: formatDescription(row),
+        direction: signal ? signal.toUpperCase() : "-",
+        qtyTraded: scaledTrade.qtyTraded,
+        betSizeUsd: scaledTrade.totalStakeUsd,
+        entryPrice: scaledTrade.entryPrice,
+        exitPrice: toNumber(row["Exit price"] || row.exit_price),
+        drawdownPct: computeDrawdownPctFromRow(row, scaledTrade.qtyTraded, scaledTrade.entryPrice),
+        result,
+        pnlUsd: pnl
+      };
+    })
+    .sort((a, b) => {
+      const aTs = toNumber(a.entryTs);
+      const bTs = toNumber(b.entryTs);
+      if (Number.isFinite(aTs) && Number.isFinite(bTs) && aTs !== bTs) return bTs - aTs;
+      return String(b.date).localeCompare(String(a.date));
+    });
+
+  return {
+    label,
+    startingEquity,
+    betSizeUsd: targetBetSize,
+    trades,
+    wins,
+    losses,
+    netPnl,
+    profitFactor,
+    winRatePct,
+    maxDrawdownUsd,
+    maxDrawdownPct,
+    maxDdStartDate,
+    maxDdEndDate,
+    maxDdDurationDays,
+    endingEquity,
+    cagrPct,
+    equity,
+    equityCumulative,
+    labels,
+    drawdownPctSeries,
+    monthlyReturns,
+    tradeLog,
+    addTriggerPattern,
+    periodStart: bounded[0] ? extractIsoDate(bounded[0]) : windowStartIso,
+    periodEnd: bounded[bounded.length - 1] ? extractIsoDate(bounded[bounded.length - 1]) : windowEndIso,
+    resetEachYear
+  };
+}
+
+async function loadBacktestDatasets() {
+  const loaded = await Promise.all(
+    BACKTEST_STRATEGIES.map(async (config) => {
+      try {
+        const rawRows = await fetchCsv(config.file);
+        const rows = config.format === "tradestation"
+          ? normalizeTradeStationRows(rawRows, config.defaultInstrument || "MNQ")
+          : rawRows;
+        if (!rows.length) return null;
+        const headerKeys = Object.keys(rows[0]);
+        const pnlColumn = config.pnlColumns.find((key) => headerKeys.includes(key));
+        if (!pnlColumn) return null;
+        return { id: config.id, label: config.label, rows, pnlColumn };
+      } catch (error) {
+        console.warn(`Skipping strategy ${config.label}:`, error.message);
+        return null;
+      }
+    })
+  );
+
+  return loaded.filter(Boolean);
+}
+
+function computeBacktestsFromDatasets(
+  backtestDatasets,
+  startingEquity,
+  targetBetSize,
+  startDateIso = "",
+  blendStrategyIds = [],
+  resetEachYear = true
+) {
+  const assetFilter = String(currentAssetFilter || "both").toLowerCase();
+  const filterRows = (rows) => {
+    if (assetFilter === "both") return rows;
+    return rows.filter((row) => {
+      const asset = String(row.asset || "").trim().toLowerCase();
+      const instrument = String(row.Instrument || row.instrument || "").trim().toLowerCase();
+      return asset === assetFilter || instrument.includes(assetFilter);
+    });
+  };
+
+  const singleStrategyMetrics = backtestDatasets.map((dataset) => {
+    const metrics = computeBacktestMetrics(
+      dataset.label,
+      filterRows(dataset.rows),
+      dataset.pnlColumn,
+      startingEquity,
+      targetBetSize,
+      startDateIso,
+      resetEachYear
+    );
+    return { ...metrics, id: dataset.id };
+  });
+
+  const availableBlendIds = backtestDatasets.map((d) => d.id);
+  const blendSet = new Set(
+    (Array.isArray(blendStrategyIds) ? blendStrategyIds : [])
+      .filter((id) => availableBlendIds.includes(id))
+  );
+  if (!blendSet.size) availableBlendIds.forEach((id) => blendSet.add(id));
+  const blendedRows = backtestDatasets
+    .filter((dataset) => blendSet.has(dataset.id))
+    .flatMap((dataset) => filterRows(dataset.rows).map((row) => ({ ...row, __strategyLabel: dataset.label })));
+  const blendedStartingEquity = startingEquity * Math.max(blendSet.size, 1);
+  const blendedMetrics = computeBacktestMetrics(
+    "Blended Portfolio (Selected Strategies)",
+    blendedRows,
+    "Profit",
+    blendedStartingEquity,
+    targetBetSize,
+    startDateIso,
+    resetEachYear
+  );
+
+  return [...singleStrategyMetrics, { ...blendedMetrics, id: "blend_selected" }];
+}
+
+function renderDatasetWindow(metricsRows) {
+  const starts = metricsRows.map((m) => m.periodStart).filter(Boolean).sort();
+  const ends = metricsRows.map((m) => m.periodEnd).filter(Boolean).sort();
+  const start = starts[0] ? starts[0].slice(0, 10) : "-";
+  const end = ends.length ? ends[ends.length - 1].slice(0, 10) : "-";
+  setTextById("datasetWindow", `Dataset window: ${start} to ${end}`);
+}
+
+function renderTopKpis(strategy) {
+  const profitableMonths = strategy.monthlyReturns.filter((m) => m.returnPct > 0).length;
+  const totalMonths = strategy.monthlyReturns.length;
+  const maxDrawdownText = Number.isFinite(strategy.maxDrawdownPct)
+    ? `-${fmtPercent(strategy.maxDrawdownPct, 1)}`
+    : "-";
+  const returnMetric = strategy.resetEachYear
+    ? computeDisplayRateOfReturn(
+      strategy.periodStart,
+      strategy.periodEnd,
+      strategy.startingEquity,
+      strategy.endingEquity
+    )
+    : {
+      label: "Compounded CAGR",
+      valuePct: computeCagr(
+        strategy.periodStart,
+        strategy.periodEnd,
+        strategy.endingEquity,
+        strategy.startingEquity
+      )
+    };
+  if (strategy.resetEachYear && returnMetric.label === "Annualized Return (Compounded)") {
+    returnMetric.label = "Annualized Return (Based on Initial)";
+    const avgAnnualReturnPct = computeAverageAnnualReturnBasedOnInitial(strategy.tradeLog, strategy.startingEquity);
+    if (Number.isFinite(avgAnnualReturnPct)) returnMetric.valuePct = avgAnnualReturnPct;
+  }
+  const returnLabelEl = document.getElementById("rateOfReturnLabel");
+
+  if (returnLabelEl) returnLabelEl.textContent = returnMetric.label;
+  setTextById("annualReturn", fmtPercent(returnMetric.valuePct, 1));
+  setTextById("maxDrawdown", maxDrawdownText);
+  const maxDrawdownEl = document.getElementById("maxDrawdown");
+  const maxDrawdownCard = document.getElementById("maxDrawdownCard") || maxDrawdownEl?.closest(".kpi-card");
+  if (maxDrawdownEl) {
+    const hasDdInfo = Number.isFinite(strategy.maxDrawdownUsd)
+      && Number.isFinite(strategy.maxDdDurationDays)
+      && strategy.maxDdStartDate
+      && strategy.maxDdEndDate;
+    if (hasDdInfo) {
+      const tooltipText = [
+        `Amount: ${fmtCurrency(strategy.maxDrawdownUsd)}`,
+        `Started: ${strategy.maxDdStartDate}`,
+        `Ended: ${strategy.maxDdEndDate}`,
+        `Duration: ${strategy.maxDdDurationDays} day${strategy.maxDdDurationDays === 1 ? "" : "s"}`
+      ].join("\n");
+      maxDrawdownEl.title = tooltipText;
+      if (maxDrawdownCard) {
+        maxDrawdownCard.title = tooltipText;
+        maxDrawdownCard.setAttribute("data-tooltip", tooltipText);
+      }
+    } else {
+      maxDrawdownEl.removeAttribute("title");
+      if (maxDrawdownCard) {
+        maxDrawdownCard.removeAttribute("title");
+        maxDrawdownCard.removeAttribute("data-tooltip");
+      }
+    }
+  }
+  setTextById("numTrades", strategy.trades.toLocaleString("en-US"));
+  setTextById("winRate", fmtPercent(strategy.winRatePct, 1));
+  setTextById("winMonths", `${profitableMonths}/${totalMonths}`);
+  setTextById("profitFactor", fmtNumber(strategy.profitFactor, 2));
+}
+
+function buildMonthlyReturnsFromEquityPoints(points) {
+  const monthlyReturns = [];
+  if (!Array.isArray(points) || points.length < 2) return monthlyReturns;
+
+  let currentMonth = "";
+  let monthStartEquity = NaN;
+  let monthPnl = 0;
+
+  for (let i = 1; i < points.length; i += 1) {
+    const prev = points[i - 1];
+    const curr = points[i];
+    if (!Number.isFinite(prev.equity) || !Number.isFinite(curr.equity)) continue;
+    const monthKey = monthKeyFromUtc(toIsoDateString(curr.date));
+    const pnl = curr.equity - prev.equity;
+
+    if (!currentMonth) {
+      currentMonth = monthKey;
+      monthStartEquity = prev.equity;
+      monthPnl = 0;
+    } else if (monthKey !== currentMonth) {
+      monthlyReturns.push({
+        monthKey: currentMonth,
+        startEquity: monthStartEquity,
+        pnl: monthPnl,
+        returnPct: monthStartEquity !== 0 ? (monthPnl / monthStartEquity) * 100 : NaN
+      });
+      currentMonth = monthKey;
+      monthStartEquity = prev.equity;
+      monthPnl = 0;
+    }
+
+    monthPnl += pnl;
+  }
+
+  if (currentMonth) {
+    monthlyReturns.push({
+      monthKey: currentMonth,
+      startEquity: monthStartEquity,
+      pnl: monthPnl,
+      returnPct: monthStartEquity !== 0 ? (monthPnl / monthStartEquity) * 100 : NaN
+    });
+  }
+
+  return monthlyReturns;
+}
+
+function buildTopStatsFromEquitySeries(points) {
+  const cleanPoints = (Array.isArray(points) ? points : [])
+    .filter((p) => p?.date instanceof Date && Number.isFinite(p.date.getTime()) && Number.isFinite(p.equity))
+    .sort((a, b) => a.date - b.date);
+
+  if (cleanPoints.length < 2) {
+    return {
+      trades: 0,
+      wins: 0,
+      losses: 0,
+      netPnl: 0,
+      maxDrawdownUsd: 0,
+      maxDdStartDate: "",
+      maxDdEndDate: "",
+      maxDdDurationDays: NaN,
+      endingEquity: NaN,
+      cagrPct: NaN,
+      maxDrawdownPct: NaN,
+      winRatePct: NaN,
+      profitFactor: NaN,
+      monthlyReturns: [],
+      periodStart: "",
+      periodEnd: ""
+    };
+  }
+
+  const startEquity = cleanPoints[0].equity;
+  let wins = 0;
+  let losses = 0;
+  let grossProfit = 0;
+  let grossLossAbs = 0;
+  let peak = startEquity;
+  let maxDrawdownUsd = 0;
+  let maxDrawdownPct = 0;
+  let peakDate = toIsoDateString(cleanPoints[0].date);
+  let maxDdStartDate = "";
+  let maxDdEndDate = "";
+  let maxDdDurationDays = NaN;
+
+  for (let i = 1; i < cleanPoints.length; i += 1) {
+    const currentEquity = cleanPoints[i].equity;
+    const currentDateIso = toIsoDateString(cleanPoints[i].date);
+    if (currentEquity >= peak) {
+      peak = currentEquity;
+      peakDate = currentDateIso || peakDate;
+    }
+    const ddUsd = peak - currentEquity;
+    const ddPct = peak > 0 ? (ddUsd / peak) * 100 : 0;
+    if (ddPct > maxDrawdownPct) {
+      maxDrawdownPct = ddPct;
+      maxDrawdownUsd = ddUsd;
+      maxDdStartDate = peakDate;
+      maxDdEndDate = currentDateIso;
+      maxDdDurationDays = dayDiffIso(maxDdStartDate, maxDdEndDate);
+    }
+    const pnl = cleanPoints[i].equity - cleanPoints[i - 1].equity;
+    if (!Number.isFinite(pnl)) continue;
+    if (pnl >= 0) {
+      wins += 1;
+      grossProfit += pnl;
+    } else {
+      losses += 1;
+      grossLossAbs += Math.abs(pnl);
+    }
+  }
+
+  const trades = wins + losses;
+  const periodStart = toIsoDateString(cleanPoints[0].date);
+  const periodEnd = toIsoDateString(cleanPoints[cleanPoints.length - 1].date);
+  const endingEquity = cleanPoints[cleanPoints.length - 1].equity;
+  const netPnl = endingEquity - startEquity;
+  const cagrPct = computeCagrFromEquity(
+    periodStart,
+    periodEnd,
+    startEquity,
+    endingEquity
+  );
+
+  return {
+    trades,
+    wins,
+    losses,
+    netPnl,
+    maxDrawdownUsd,
+    maxDdStartDate,
+    maxDdEndDate,
+    maxDdDurationDays,
+    endingEquity,
+    cagrPct,
+    maxDrawdownPct,
+    winRatePct: trades > 0 ? (wins / trades) * 100 : NaN,
+    profitFactor: grossLossAbs > 0 ? grossProfit / grossLossAbs : NaN,
+    monthlyReturns: buildMonthlyReturnsFromEquityPoints(cleanPoints),
+    periodStart,
+    periodEnd
+  };
+}
+
+function parseIsoAsUtcDate(isoDate) {
+  if (!isoDate) return null;
+  const parsed = new Date(`${String(isoDate).slice(0, 10)}T00:00:00Z`);
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+function addUtcDays(date, days) {
+  return new Date(date.getTime() + days * 86400000);
+}
+
+function buildBacktestEquityPoints(strategy) {
+  return strategy.labels
+    .map((label, idx) => {
+      const date = parseIsoAsUtcDate(label);
+      const equity = strategy.equity[idx];
+      if (!date || !Number.isFinite(equity)) return null;
+      return { date, equity };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.date - b.date);
+}
+
+function buildMcSeriesFromPaths(mcPathRows, key) {
+  const anchorDate = new Date("2025-01-01T00:00:00Z");
+  return mcPathRows
+    .map((row) => {
+      const step = toNumber(row.trade_number);
+      const equity = toNumber(row[key]);
+      if (!Number.isFinite(step) || !Number.isFinite(equity)) return null;
+      return { date: addUtcDays(anchorDate, step - 1), equity };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.date - b.date);
+}
+
+function buildMcSeriesFromPathMidpoint(mcPathRows, lowKey, highKey) {
+  const anchorDate = new Date("2025-01-01T00:00:00Z");
+  return mcPathRows
+    .map((row) => {
+      const step = toNumber(row.trade_number);
+      const low = toNumber(row[lowKey]);
+      const high = toNumber(row[highKey]);
+      if (!Number.isFinite(step) || !Number.isFinite(low) || !Number.isFinite(high)) return null;
+      return { date: addUtcDays(anchorDate, step - 1), equity: low + (high - low) * 0.5 };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.date - b.date);
+}
+
+function buildMcBackfillTradeTemplate(strategy) {
+  const entryPrices = strategy.tradeLog.map((t) => toNumber(t.entryPrice)).filter(Number.isFinite);
+  const avgEntryPrice = entryPrices.length ? entryPrices.reduce((acc, v) => acc + v, 0) / entryPrices.length : 0.5;
+  return {
+    // MC synthetic rows should always respect the configured base bet size input.
+    avgBetSize: Math.max(currentBetSize, 1),
+    avgEntryPrice: Math.min(Math.max(avgEntryPrice, 0.01), 0.99)
+  };
+}
+
+function buildMcDailyDeltaMap(mcSeries) {
+  const sorted = [...(Array.isArray(mcSeries) ? mcSeries : [])]
+    .filter((p) => p?.date instanceof Date && Number.isFinite(p.date.getTime()) && Number.isFinite(p.equity))
+    .sort((a, b) => a.date - b.date);
+  const map = new Map();
+  for (let i = 1; i < sorted.length; i += 1) {
+    const iso = toIsoDateString(sorted[i].date);
+    const delta = sorted[i].equity - sorted[i - 1].equity;
+    if (iso && Number.isFinite(delta)) map.set(iso, delta);
+  }
+  return map;
+}
+
+function stitchBacktestWithMcBackfill(strategy, mcSeries, sourceLabel) {
+  const { startDate: windowStart, endDate: windowEnd } = getPerformanceWindow();
+  if (!Array.isArray(mcSeries) || mcSeries.length < 2) {
+    return {
+      ...strategy,
+      label: `${strategy.label} + ${sourceLabel}`,
+      topStatsLabel: sourceLabel
+    };
+  }
+
+  const mcDeltaByDate = buildMcDailyDeltaMap(mcSeries);
+  const historicalTradesAsc = [...strategy.tradeLog]
+    .filter((t) => /^\d{4}-\d{2}-\d{2}$/.test(String(t.date || "")))
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const firstHistoricalIso = historicalTradesAsc[0]?.date || null;
+  const historicalByDate = new Map();
+  historicalTradesAsc.forEach((trade) => {
+    const key = String(trade.date);
+    if (!historicalByDate.has(key)) historicalByDate.set(key, []);
+    historicalByDate.get(key).push(trade);
+  });
+
+  const stitchedPoints = [{ date: new Date(windowStart.getTime()), equity: strategy.startingEquity }];
+  const combinedTradeEvents = [];
+  let stitchedEquity = strategy.startingEquity;
+  const tradeTemplate = buildMcBackfillTradeTemplate(strategy);
+  const addPattern = Array.isArray(strategy.addTriggerPattern) ? strategy.addTriggerPattern : [];
+  let syntheticIdx = 0;
+
+  for (let day = new Date(windowStart.getTime()); day <= windowEnd; day = addUtcDays(day, 1)) {
+    const dayIso = toIsoDateString(day);
+    const historicalTrades = historicalByDate.get(dayIso) || [];
+
+    if (historicalTrades.length) {
+      historicalTrades.forEach((trade) => {
+        const pnl = toNumber(trade.pnlUsd);
+        if (!Number.isFinite(pnl)) return;
+        stitchedEquity += pnl;
+        stitchedPoints.push({ date: new Date(day.getTime()), equity: stitchedEquity });
+        combinedTradeEvents.push(trade);
+      });
+      continue;
+    }
+
+    // MC backfill is allowed only before the backtest window starts.
+    if (!firstHistoricalIso || dayIso >= firstHistoricalIso) continue;
+
+    const rawDelta = mcDeltaByDate.get(dayIso);
+    if (!Number.isFinite(rawDelta)) continue;
+    const pattern = addPattern.length ? addPattern[syntheticIdx % addPattern.length] : null;
+    const add1230 = Boolean(pattern?.add1230);
+    const add1430 = Boolean(pattern?.add1430);
+    const effectiveStakeMult = 1 + (add1230 ? 0.2 : 0) + (add1430 ? 0.2 : 0);
+    const betSizeUsd = tradeTemplate.avgBetSize * effectiveStakeMult;
+    const scaledDelta = rawDelta * effectiveStakeMult;
+    const delta = Math.max(scaledDelta, -betSizeUsd);
+    stitchedEquity += delta;
+    stitchedPoints.push({ date: new Date(day.getTime()), equity: stitchedEquity });
+    const direction = delta >= 0 ? "Up" : "Down";
+    const inferredEntryFromPnl = delta >= 0 && betSizeUsd > 0 ? betSizeUsd / (betSizeUsd + delta) : NaN;
+    const entryPrice = Number.isFinite(inferredEntryFromPnl)
+      ? Math.min(Math.max(inferredEntryFromPnl, 0.01), 0.99)
+      : tradeTemplate.avgEntryPrice;
+
+    combinedTradeEvents.push({
+      date: dayIso,
+      entryTime: "-",
+      exitTime: "-",
+      market: `MC Backfill (${sourceLabel})`,
+      description: "MC BACKFILL",
+      direction,
+      qtyTraded: 1,
+      betSizeUsd,
+      entryPrice,
+      exitPrice: NaN,
+      drawdownPct: NaN,
+      result: delta >= 0 ? "Win" : "Loss",
+      pnlUsd: delta
+    });
+    syntheticIdx += 1;
+  }
+
+  const topStats = buildTopStatsFromEquitySeries(stitchedPoints);
+  const combinedTradeLog = [...combinedTradeEvents].sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  const combinedWins = combinedTradeLog.filter((t) => t.result === "Win").length;
+  const combinedLosses = combinedTradeLog.filter((t) => t.result === "Loss").length;
+  const combinedTradeCount = combinedWins + combinedLosses;
+  const combinedGrossProfit = combinedTradeLog
+    .map((t) => toNumber(t.pnlUsd))
+    .filter((v) => Number.isFinite(v) && v >= 0)
+    .reduce((acc, v) => acc + v, 0);
+  const combinedGrossLossAbs = combinedTradeLog
+    .map((t) => toNumber(t.pnlUsd))
+    .filter((v) => Number.isFinite(v) && v < 0)
+    .reduce((acc, v) => acc + Math.abs(v), 0);
+  const stitchedLabels = stitchedPoints.map((p) => toIsoDateString(p.date));
+  const stitchedEquitySeries = stitchedPoints.map((p) => p.equity);
+  const stitchedStart = stitchedLabels[0] || strategy.periodStart;
+  const stitchedEnd = stitchedLabels[stitchedLabels.length - 1] || strategy.periodEnd;
+  const endingEquity = stitchedEquity;
+  const netPnl = endingEquity - strategy.startingEquity;
+
+  return {
+    ...strategy,
+    ...topStats,
+    trades: combinedTradeCount,
+    wins: combinedWins,
+    losses: combinedLosses,
+    netPnl,
+    endingEquity,
+    winRatePct: combinedTradeCount > 0 ? (combinedWins / combinedTradeCount) * 100 : NaN,
+    profitFactor: combinedGrossLossAbs > 0 ? combinedGrossProfit / combinedGrossLossAbs : NaN,
+    labels: stitchedLabels,
+    equity: stitchedEquitySeries,
+    periodStart: stitchedStart,
+    periodEnd: stitchedEnd,
+    label: `${strategy.label} + ${sourceLabel}`,
+    topStatsLabel: sourceLabel,
+    tradeLog: combinedTradeLog
+  };
+}
+
+function buildMcTopSources(strategy, mcPercentileRows, mcPathRows) {
+  if (!Array.isArray(mcPathRows) || !mcPathRows.length) {
+    return {
+      backtest: strategy,
+      mc_p95: strategy,
+      mc_p50: strategy,
+      mc_p1: strategy
+    };
+  }
+
+  const optimisticSeries = buildMcSeriesFromPaths(mcPathRows, "equity_p95_path");
+  const middleSeries = buildMcSeriesFromPathMidpoint(mcPathRows, "equity_p5_path", "equity_p95_path");
+  const pessimisticSeries = buildMcSeriesFromPaths(mcPathRows, "equity_p1_path");
+
+  return {
+    backtest: strategy,
+    mc_p95: stitchBacktestWithMcBackfill(strategy, optimisticSeries, "95% Percentile MC Sim (Optimistic)"),
+    mc_p50: stitchBacktestWithMcBackfill(strategy, middleSeries, "50% Percentile MC Sim (Middle Ground)"),
+    mc_p1: stitchBacktestWithMcBackfill(strategy, pessimisticSeries, "1% Percentile MC Sim (Pessimistic)")
+  };
+}
+
+function buildMonthlyMatrix(strategy) {
+  const yearMap = new Map();
+  strategy.monthlyReturns.forEach((month) => {
+    const [year, monthNum] = month.monthKey.split("-");
+    if (!yearMap.has(year)) {
+      yearMap.set(year, {
+        months: Array(12).fill(null),
+        pnl: 0,
+        startEquity: month.startEquity
+      });
+    }
+    const yearRow = yearMap.get(year);
+    const idx = Number(monthNum) - 1;
+    if (idx >= 0 && idx < 12) yearRow.months[idx] = month.returnPct;
+    yearRow.pnl += month.pnl;
+  });
+
+  return [...yearMap.entries()]
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .map(([year, row]) => ({
+      year,
+      months: row.months,
+      ytd: row.startEquity !== 0 ? (row.pnl / row.startEquity) * 100 : NaN
+    }));
+}
+
+function monthClass(value) {
+  if (!Number.isFinite(value)) return "month-flat";
+  if (value > 0) return "month-pos";
+  if (value < 0) return "month-neg";
+  return "month-flat";
+}
+
+function renderMonthlyTable(strategy) {
+  const tbody = document.querySelector("#monthlyReturnsTable tbody");
+  tbody.innerHTML = "";
+  const rows = buildMonthlyMatrix(strategy);
+
+  rows.forEach((row) => {
+    const tr = document.createElement("tr");
+    const yearCell = document.createElement("td");
+    yearCell.textContent = row.year;
+    tr.appendChild(yearCell);
+
+    row.months.forEach((monthValue) => {
+      const td = document.createElement("td");
+      td.className = monthClass(monthValue);
+      td.textContent = Number.isFinite(monthValue) ? fmtPercent(monthValue, 1) : "-";
+      tr.appendChild(td);
+    });
+
+    const ytd = document.createElement("td");
+    ytd.className = monthClass(row.ytd);
+    ytd.textContent = Number.isFinite(row.ytd) ? fmtPercent(row.ytd, 1) : "-";
+    tr.appendChild(ytd);
+    tbody.appendChild(tr);
+  });
+}
+
+function renderSummaryPanel(strategy) {
+  const profitableMonths = strategy.monthlyReturns.filter((m) => m.returnPct > 0).length;
+  const totalMonths = strategy.monthlyReturns.length;
+
+  setTextById("activeStrategyLabel", `Strategy: ${strategy.label}`);
+  setTextById("sumTrades", strategy.trades.toLocaleString("en-US"));
+  setTextById("sumInitial", fmtCurrency(strategy.startingEquity));
+  setTextById("sumCurrent", fmtCurrency(strategy.endingEquity));
+  setTextById("sumWinRate", fmtPercent(strategy.winRatePct, 1));
+  setTextById("sumWins", `${strategy.wins}/${strategy.trades}`);
+  setTextById("sumMonths", `${profitableMonths}/${totalMonths}`);
+  const netProfitPct = strategy.startingEquity > 0 ? (strategy.netPnl / strategy.startingEquity) * 100 : NaN;
+  setTextById("sumNetProfit", `${fmtCurrency(strategy.netPnl)} (${fmtPercent(netProfitPct, 1)})`);
+  setTextById("sumDrawdown", `-${fmtPercent(strategy.maxDrawdownPct, 2)} (${fmtCurrency(strategy.maxDrawdownUsd)})`);
+  setTextById("sumProfitFactor", fmtNumber(strategy.profitFactor, 2));
+}
+
+function renderTradeLog(strategy) {
+  const tbody = document.querySelector("#tradeLogTable tbody");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+
+  const totalRows = strategy.tradeLog.length;
+  const totalPages = Math.max(Math.ceil(totalRows / TRADE_LOG_PAGE_SIZE), 1);
+  tradeLogCurrentPage = Math.min(Math.max(tradeLogCurrentPage, 1), totalPages);
+  const start = (tradeLogCurrentPage - 1) * TRADE_LOG_PAGE_SIZE;
+  const end = start + TRADE_LOG_PAGE_SIZE;
+  const rows = strategy.tradeLog.slice(start, end);
+
+  rows.forEach((trade) => {
+    const tr = document.createElement("tr");
+    const cells = [
+      trade.entryTime || "-",
+      trade.market || "-",
+      trade.description || "-",
+      trade.direction || "-",
+      Number.isFinite(trade.qtyTraded) ? String(Math.round(trade.qtyTraded)) : "-",
+      Number.isFinite(trade.entryPrice) ? trade.entryPrice.toFixed(2) : "-",
+      trade.exitTime || "-",
+      Number.isFinite(trade.exitPrice) ? trade.exitPrice.toFixed(2) : "-",
+      fmtCurrency(trade.pnlUsd)
+    ];
+    cells.forEach((value, idx) => {
+      const td = document.createElement("td");
+      td.textContent = String(value);
+      if (idx === 8) td.className = Number.isFinite(trade.pnlUsd)
+        ? trade.pnlUsd >= 0
+          ? "positive"
+          : "negative"
+        : "";
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+
+  const prevBtn = document.getElementById("tradeLogPrev");
+  const nextBtn = document.getElementById("tradeLogNext");
+  const pageInfo = document.getElementById("tradeLogPageInfo");
+  if (pageInfo) pageInfo.textContent = `Page ${tradeLogCurrentPage} / ${totalPages}`;
+  if (prevBtn) {
+    prevBtn.disabled = tradeLogCurrentPage <= 1;
+    prevBtn.onclick = () => {
+      if (tradeLogCurrentPage <= 1) return;
+      tradeLogCurrentPage -= 1;
+      renderTradeLog(strategy);
+    };
+  }
+  if (nextBtn) {
+    nextBtn.disabled = tradeLogCurrentPage >= totalPages;
+    nextBtn.onclick = () => {
+      if (tradeLogCurrentPage >= totalPages) return;
+      tradeLogCurrentPage += 1;
+      renderTradeLog(strategy);
+    };
+  }
+}
+
+function renderPeriodicalReturns(strategy) {
+  const tbody = document.querySelector("#periodReturnsTable tbody");
+  const granularitySelect = document.getElementById("periodReturnsGranularity");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  const granularity = String(granularitySelect?.value || "monthly");
+  const bucketMap = new Map();
+  (Array.isArray(strategy?.tradeLog) ? strategy.tradeLog : []).forEach((trade) => {
+    const date = String(trade?.date || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return;
+    const key = granularity === "annual" ? date.slice(0, 4) : date.slice(0, 7);
+    const pnl = toNumber(trade?.pnlUsd);
+    if (!Number.isFinite(pnl)) return;
+    bucketMap.set(key, (bucketMap.get(key) || 0) + pnl);
+  });
+
+  const rows = [...bucketMap.entries()].sort((a, b) => String(b[0]).localeCompare(String(a[0])));
+  rows.forEach(([period, pnl]) => {
+    const tr = document.createElement("tr");
+    const periodTd = document.createElement("td");
+    periodTd.textContent = period;
+    const pnlTd = document.createElement("td");
+    pnlTd.textContent = fmtCurrency(pnl);
+    pnlTd.className = pnl >= 0 ? "positive" : "negative";
+    tr.appendChild(periodTd);
+    tr.appendChild(pnlTd);
+    tbody.appendChild(tr);
+  });
+}
+
+function drawEquityChart(strategy) {
+  const ctx = document.getElementById("equityChart");
+  const equitySeries = Array.isArray(strategy.equityCumulative) && strategy.equityCumulative.length
+    ? strategy.equityCumulative
+    : strategy.equity;
+
+  equityChartRef?.destroy();
+  equityChartRef = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: strategy.labels,
+      datasets: [
+        {
+          label: strategy.label,
+          data: equitySeries,
+          borderColor: "#26d07c",
+          backgroundColor: (context) => {
+            const chart = context.chart;
+            const { ctx: chartCtx, chartArea } = chart;
+            if (
+              !chartArea ||
+              !Number.isFinite(chartArea.top) ||
+              !Number.isFinite(chartArea.bottom) ||
+              !Number.isFinite(chartArea.height)
+            ) {
+              return "rgba(38, 208, 124, 0)";
+            }
+            const gradient = chartCtx.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+            gradient.addColorStop(0, "rgba(38, 208, 124, 0.42)");
+            gradient.addColorStop(0.45, "rgba(38, 208, 124, 0.18)");
+            gradient.addColorStop(0.75, "rgba(38, 208, 124, 0.07)");
+            gradient.addColorStop(1, "rgba(38, 208, 124, 0)");
+            return gradient;
+          },
+          fill: "start",
+          tension: 0.22,
+          pointRadius: 0,
+          borderWidth: 2
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { maxTicksLimit: 10, color: "#9eb0d6" }, grid: { color: "rgba(158,176,214,0.1)" } },
+        y: { ticks: { color: "#9eb0d6" }, grid: { color: "rgba(158,176,214,0.1)" } }
+      },
+      plugins: {
+        legend: { display: false }
+      }
+    }
+  });
+}
+
+function renderMcSummary(mcStatsRows) {
+  const row = mcStatsRows[0] || {};
+  setTextById("mcMedianReturn", fmtPercent(toNumber(row.median_return_pct), 2));
+  setTextById("mcP05Return", fmtPercent(toNumber(row.p05_return_pct), 2));
+  setTextById("mcP95Return", fmtPercent(toNumber(row.p95_return_pct), 2));
+  setTextById("mcLossProb", fmtPercent(toNumber(row.probability_loss_pct), 2));
+}
+
+function drawMonteCarloChart(mcRows) {
+  const labels = mcRows.map((r) => toNumber(r.trade_number));
+  const p1 = mcRows.map((r) => toNumber(r.equity_p1_path));
+  const p5 = mcRows.map((r) => toNumber(r.equity_p5_path));
+  const p95 = mcRows.map((r) => toNumber(r.equity_p95_path));
+  const p25 = p5.map((v, i) => (Number.isFinite(v) && Number.isFinite(p95[i]) ? v + 0.25 * (p95[i] - v) : NaN));
+  const p50 = p5.map((v, i) => (Number.isFinite(v) && Number.isFinite(p95[i]) ? v + 0.5 * (p95[i] - v) : NaN));
+  const p75 = p5.map((v, i) => (Number.isFinite(v) && Number.isFinite(p95[i]) ? v + 0.75 * (p95[i] - v) : NaN));
+
+  const ctx = document.getElementById("mcPathChart");
+  mcPathChartRef?.destroy();
+  mcPathChartRef = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        { label: "P1 Path", data: p1, borderColor: "#ff8e8e", tension: 0.12, pointRadius: 0, borderWidth: 2 },
+        { label: "P5 Path", data: p5, borderColor: "#ffd166", tension: 0.12, pointRadius: 0, borderWidth: 2 },
+        {
+          label: "P25 Path",
+          data: p25,
+          borderColor: "rgba(173, 216, 230, 0.55)",
+          borderDash: [6, 4],
+          tension: 0.12,
+          pointRadius: 0,
+          borderWidth: 1.4
+        },
+        {
+          label: "P50 Path",
+          data: p50,
+          borderColor: "rgba(173, 216, 230, 0.75)",
+          tension: 0.12,
+          pointRadius: 0,
+          borderWidth: 1.6
+        },
+        {
+          label: "P75 Path",
+          data: p75,
+          borderColor: "rgba(173, 216, 230, 0.55)",
+          borderDash: [6, 4],
+          tension: 0.12,
+          pointRadius: 0,
+          borderWidth: 1.4
+        },
+        { label: "P95 Path", data: p95, borderColor: "#66e3c4", tension: 0.12, pointRadius: 0, borderWidth: 2 }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { maxTicksLimit: 12, color: "#9eb0d6" }, grid: { color: "rgba(158,176,214,0.1)" } },
+        y: { ticks: { color: "#9eb0d6" }, grid: { color: "rgba(158,176,214,0.1)" } }
+      },
+      plugins: {
+        legend: { labels: { color: "#e8eefc" } }
+      }
+    }
+  });
+}
+
+function computeDrawdownPct(equitySeries) {
+  let peak = -Infinity;
+  let maxDrawdownPct = 0;
+  equitySeries.forEach((v) => {
+    if (!Number.isFinite(v)) return;
+    if (v > peak) peak = v;
+    if (peak > 0) {
+      const ddPct = ((peak - v) / peak) * 100;
+      if (ddPct > maxDrawdownPct) maxDrawdownPct = ddPct;
+    }
+  });
+  return maxDrawdownPct;
+}
+
+function renderMcPathStats(percentileRows) {
+  const pathSelect = document.getElementById("mcPathSelect");
+  const startInput = document.getElementById("mcStartDate");
+  const endInput = document.getElementById("mcEndDate");
+  const loadBtn = document.getElementById("mcLoadStats");
+
+  if (!pathSelect || !startInput || !endInput || !loadBtn) return;
+
+  const defaultStart = "2025-01-01";
+  const todayIso = toIsoDateString(new Date());
+  startInput.value = defaultStart;
+  endInput.value = todayIso;
+  pathSelect.value = "p50";
+
+  const writeStat = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+  };
+
+  const anchorDate = new Date(`${defaultStart}T00:00:00Z`);
+  const load = () => {
+    const pathKey = pathSelect.value;
+    const startDate = new Date(`${startInput.value}T00:00:00Z`);
+    const endDate = new Date(`${endInput.value}T23:59:59Z`);
+    if (!Number.isFinite(startDate.getTime()) || !Number.isFinite(endDate.getTime()) || startDate > endDate) {
+      writeStat("mcPathStartEquity", "-");
+      writeStat("mcPathEndEquity", "-");
+      writeStat("mcPathReturnPct", "Invalid date range");
+      writeStat("mcPathMaxDdPct", "-");
+      writeStat("mcPathCagrPct", "-");
+      writeStat("mcPathDaysUsed", "-");
+      return;
+    }
+
+    const filtered = percentileRows
+      .map((row) => {
+        const dayNum = toNumber(row.day);
+        if (!Number.isFinite(dayNum)) return null;
+        const date = new Date(anchorDate.getTime() + (dayNum - 1) * 86400000);
+        const equity = toNumber(row[pathKey]);
+        if (!Number.isFinite(equity)) return null;
+        return { date, equity };
+      })
+      .filter(Boolean)
+      .filter((p) => p.date >= startDate && p.date <= endDate);
+
+    if (!filtered.length) {
+      writeStat("mcPathStartEquity", "-");
+      writeStat("mcPathEndEquity", "-");
+      writeStat("mcPathReturnPct", "No data");
+      writeStat("mcPathMaxDdPct", "-");
+      writeStat("mcPathCagrPct", "-");
+      writeStat("mcPathDaysUsed", "0");
+      return;
+    }
+
+    const startEq = filtered[0].equity;
+    const endEq = filtered[filtered.length - 1].equity;
+    const retPct = startEq !== 0 ? ((endEq - startEq) / startEq) * 100 : NaN;
+    const maxDdPct = computeDrawdownPct(filtered.map((p) => p.equity));
+    const days = Math.max((filtered[filtered.length - 1].date - filtered[0].date) / 86400000, 1);
+    const cagrPct = startEq > 0 ? (Math.pow(endEq / startEq, 365 / days) - 1) * 100 : NaN;
+
+    writeStat("mcPathStartEquity", fmtCurrency(startEq));
+    writeStat("mcPathEndEquity", fmtCurrency(endEq));
+    writeStat("mcPathReturnPct", fmtPercent(retPct, 2));
+    writeStat("mcPathMaxDdPct", fmtPercent(maxDdPct, 2));
+    writeStat("mcPathCagrPct", fmtPercent(cagrPct, 2));
+    writeStat("mcPathDaysUsed", String(filtered.length));
+  };
+
+  loadBtn.onclick = load;
+  load();
+}
+
+function showError(message) {
+  const headerMeta = document.getElementById("generatedAt");
+  if (headerMeta) {
+    headerMeta.textContent = "Data load failed";
+    headerMeta.className = "error";
+  }
+  const main = document.querySelector("main");
+  const panel = document.createElement("section");
+  panel.className = "panel";
+  panel.innerHTML = `<p class="error">${message}</p>`;
+  main.prepend(panel);
+}
+
+async function init() {
+  try {
+    BACKTEST_STRATEGIES = SIZING_PROFILES[currentSizingProfile];
+    const backtestDatasets = await loadBacktestDatasets();
+
+    if (!backtestDatasets.length) {
+      throw new Error("No backtest trade files could be loaded.");
+    }
+
+    const topStatsSelect = document.getElementById("topStatsSourceSelect");
+    const strategySelect = document.getElementById("strategySelect");
+    const blendStrategyPicker = document.getElementById("blendStrategyPicker");
+    const blendStrategyCheckboxes = Array.from(
+      document.querySelectorAll('input[name="blendStrategy"]')
+    );
+    const assetFilterSelect = document.getElementById("assetFilterSelect");
+    const initialCapitalInput = document.getElementById("initialCapitalInput");
+    const startDateInput = document.getElementById("startDateInput");
+    const equityModeSelect = document.getElementById("equityModeSelect");
+    const applySizingBtn = document.getElementById("applySizingBtn");
+    if (strategySelect) strategySelect.value = currentStrategyId;
+    if (assetFilterSelect) assetFilterSelect.value = currentAssetFilter;
+    if (initialCapitalInput) initialCapitalInput.value = String(currentInitialCapital);
+    if (startDateInput && isIsoDate(currentStartDateIso)) startDateInput.value = currentStartDateIso;
+    if (equityModeSelect) equityModeSelect.value = currentEquityMode;
+    blendStrategyCheckboxes.forEach((checkbox) => {
+      checkbox.checked = currentBlendStrategyIds.includes(checkbox.value);
+    });
+
+    let active = null;
+    let topSources = null;
+
+    const getSelectedSource = () => {
+      const selected = topStatsSelect?.value || "backtest";
+      return topSources?.[selected] || topSources?.backtest || active;
+    };
+
+    const renderActive = () => {
+      const selectedSource = getSelectedSource();
+      if (!selectedSource || !active) return;
+      renderTopKpis(selectedSource);
+      renderMonthlyTable(selectedSource);
+      renderSummaryPanel(selectedSource);
+      drawEquityChart(selectedSource);
+      renderPeriodicalReturns(selectedSource);
+      renderTradeLog(selectedSource);
+    };
+
+    const applySizing = () => {
+      const nextInitial = toNumber(initialCapitalInput?.value);
+      const nextAssetFilter = String(assetFilterSelect?.value || "both").toLowerCase();
+      const nextStartDate = String(startDateInput?.value || "").trim();
+      const nextEquityMode = String(equityModeSelect?.value || "reset_each_year");
+      let nextBlendIds = blendStrategyCheckboxes
+        .filter((checkbox) => checkbox.checked)
+        .map((checkbox) => checkbox.value);
+      currentInitialCapital = Number.isFinite(nextInitial) && nextInitial > 0 ? nextInitial : DEFAULT_STARTING_EQUITY;
+      currentAssetFilter = ["both", "mnq", "mes"].includes(nextAssetFilter) ? nextAssetFilter : "both";
+      currentStrategyId = String(strategySelect?.value || backtestDatasets[0]?.id || currentStrategyId);
+      currentStartDateIso = isIsoDate(nextStartDate) ? nextStartDate : "";
+      currentEquityMode = ["reset_each_year", "compounded_cagr"].includes(nextEquityMode)
+        ? nextEquityMode
+        : "reset_each_year";
+      const availableBlendIds = backtestDatasets.map((dataset) => dataset.id);
+      nextBlendIds = nextBlendIds.filter((id) => availableBlendIds.includes(id));
+      if (!nextBlendIds.length) nextBlendIds = [...availableBlendIds];
+      currentBlendStrategyIds = nextBlendIds;
+      blendStrategyCheckboxes.forEach((checkbox) => {
+        checkbox.checked = currentBlendStrategyIds.includes(checkbox.value);
+      });
+      let backtests = computeBacktestsFromDatasets(
+        backtestDatasets,
+        currentInitialCapital,
+        currentBetSize,
+        currentStartDateIso,
+        currentBlendStrategyIds,
+        currentEquityMode === "reset_each_year"
+      );
+      const validStrategyIds = backtests.map((d) => d.id);
+      if (!validStrategyIds.includes(currentStrategyId)) currentStrategyId = validStrategyIds[0];
+      if (!currentStartDateIso) {
+        const selected = backtests.find((d) => d.id === currentStrategyId) || backtests[0];
+        currentStartDateIso = selected?.periodStart || "";
+        if (isIsoDate(currentStartDateIso)) {
+          backtests = computeBacktestsFromDatasets(
+            backtestDatasets,
+            currentInitialCapital,
+            currentBetSize,
+            currentStartDateIso,
+            currentBlendStrategyIds,
+            currentEquityMode === "reset_each_year"
+          );
+        }
+      }
+      if (assetFilterSelect) assetFilterSelect.value = currentAssetFilter;
+      if (strategySelect) strategySelect.value = currentStrategyId;
+      if (initialCapitalInput) initialCapitalInput.value = String(Math.round(currentInitialCapital * 100) / 100);
+      if (startDateInput && isIsoDate(currentStartDateIso)) startDateInput.value = currentStartDateIso;
+      if (equityModeSelect) equityModeSelect.value = currentEquityMode;
+      if (blendStrategyPicker) {
+        blendStrategyPicker.style.display = currentStrategyId === "blend_selected" ? "inline-flex" : "none";
+      }
+      active = backtests.find((b) => b.id === currentStrategyId) || backtests[0];
+      topSources = { backtest: active };
+      tradeLogCurrentPage = 1;
+      renderDatasetWindow(backtests);
+      renderActive();
+    };
+
+    const sizingProfileSelect = document.getElementById("sizingProfileSelect");
+    if (sizingProfileSelect) {
+      sizingProfileSelect.value = currentSizingProfile;
+      sizingProfileSelect.onchange = () => {
+        currentSizingProfile = sizingProfileSelect.value;
+        init();
+      };
+    }
+
+    if (strategySelect) strategySelect.onchange = applySizing;
+    if (applySizingBtn) applySizingBtn.onclick = applySizing;
+    if (assetFilterSelect) assetFilterSelect.onchange = applySizing;
+    if (initialCapitalInput) initialCapitalInput.onkeydown = (event) => {
+      if (event.key === "Enter") applySizing();
+    };
+    if (startDateInput) startDateInput.onchange = applySizing;
+    if (equityModeSelect) equityModeSelect.onchange = applySizing;
+    const periodReturnsGranularity = document.getElementById("periodReturnsGranularity");
+    if (periodReturnsGranularity) {
+      periodReturnsGranularity.onchange = () => {
+        const selectedSource = getSelectedSource();
+        if (selectedSource) renderPeriodicalReturns(selectedSource);
+      };
+    }
+    blendStrategyCheckboxes.forEach((checkbox) => {
+      checkbox.onchange = () => {
+        if (strategySelect) strategySelect.value = "blend_selected";
+        currentStrategyId = "blend_selected";
+        applySizing();
+      };
+    });
+
+    applySizing();
+
+    if (topStatsSelect) {
+      topStatsSelect.onchange = () => {
+        tradeLogCurrentPage = 1;
+        const selectedSource = getSelectedSource();
+        renderTopKpis(selectedSource);
+        renderMonthlyTable(selectedSource);
+        renderSummaryPanel(selectedSource);
+        drawEquityChart(selectedSource);
+        renderPeriodicalReturns(selectedSource);
+        renderTradeLog(selectedSource);
+      };
+    }
+
+    const periodicalPanel = document.getElementById("periodicalPanel");
+    const togglePeriodicalBtn = document.getElementById("togglePeriodicalBtn");
+    if (periodicalPanel && togglePeriodicalBtn) {
+      const syncPeriodicalToggle = () => {
+        const collapsed = periodicalPanel.classList.contains("is-collapsed");
+        togglePeriodicalBtn.textContent = collapsed ? "Expand" : "Collapse";
+        togglePeriodicalBtn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      };
+      togglePeriodicalBtn.onclick = () => {
+        periodicalPanel.classList.toggle("is-collapsed");
+        syncPeriodicalToggle();
+      };
+      syncPeriodicalToggle();
+    }
+
+    let resizeFrame = null;
+    let resizeDebounceTimer = null;
+    const applyViewportClasses = () => {
+      const width = window.innerWidth || document.documentElement.clientWidth || 0;
+      document.body.classList.toggle("vp-tablet", width <= 1150);
+      document.body.classList.toggle("vp-mobile", width <= 760);
+      document.body.classList.toggle("vp-mobile-sm", width <= 600);
+    };
+
+    const onViewportResize = () => {
+      if (resizeFrame) cancelAnimationFrame(resizeFrame);
+      if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
+      resizeFrame = requestAnimationFrame(() => {
+        applyViewportClasses();
+        // Let layout settle, then resize charts once.
+        resizeDebounceTimer = setTimeout(() => {
+          equityChartRef?.resize();
+          mcPathChartRef?.resize();
+        }, 120);
+      });
+    };
+    window.addEventListener("resize", onViewportResize);
+    window.visualViewport?.addEventListener("resize", onViewportResize);
+    window.addEventListener("orientationchange", onViewportResize);
+
+    const breakpointMqls = [
+      window.matchMedia("(max-width: 1150px)"),
+      window.matchMedia("(max-width: 760px)"),
+      window.matchMedia("(max-width: 600px)")
+    ];
+    breakpointMqls.forEach((mql) => mql.addEventListener("change", onViewportResize));
+
+    const resizeTarget = document.querySelector(".page-shell");
+    if (resizeTarget && "ResizeObserver" in window) {
+      const observer = new ResizeObserver(() => {
+        onViewportResize();
+      });
+      observer.observe(resizeTarget);
+    }
+
+    applyViewportClasses();
+
+    setTextById("generatedAt", `Loaded ${new Date().toLocaleString()}`);
+  } catch (error) {
+    console.error(error);
+    showError(error.message);
+  }
+}
+
+init();
