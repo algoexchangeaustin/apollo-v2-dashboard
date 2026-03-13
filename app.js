@@ -1,4 +1,5 @@
 const DEFAULT_STARTING_EQUITY = 10000;
+const SIZING_DEFAULT_EQUITY = { "1ct": 10000, "2ct": 25000 };
 const DEFAULT_BET_SIZE = 100;
 const PERFORMANCE_START_ISO = "";
 const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -55,7 +56,7 @@ const MC_FILES = {
 let equityChartRef = null;
 let mcPathChartRef = null;
 let tradeLogCurrentPage = 1;
-let currentInitialCapital = DEFAULT_STARTING_EQUITY;
+let currentInitialCapital = SIZING_DEFAULT_EQUITY["1ct"] || DEFAULT_STARTING_EQUITY;
 let currentBetSize = DEFAULT_BET_SIZE;
 let currentAssetFilter = "both";
 let currentStrategyId = "blend_selected";
@@ -694,12 +695,13 @@ function computeBacktestsFromDatasets(
     });
   };
 
+  const perStrategyEquity = startingEquity / Math.max(backtestDatasets.length, 1);
   const singleStrategyMetrics = backtestDatasets.map((dataset) => {
     const metrics = computeBacktestMetrics(
       dataset.label,
       filterRows(dataset.rows),
       dataset.pnlColumn,
-      startingEquity,
+      perStrategyEquity,
       targetBetSize,
       startDateIso,
       resetEachYear
@@ -716,12 +718,11 @@ function computeBacktestsFromDatasets(
   const blendedRows = backtestDatasets
     .filter((dataset) => blendSet.has(dataset.id))
     .flatMap((dataset) => filterRows(dataset.rows).map((row) => ({ ...row, __strategyLabel: dataset.label })));
-  const blendedStartingEquity = startingEquity * Math.max(blendSet.size, 1);
   const blendedMetrics = computeBacktestMetrics(
     "Blended Portfolio (Selected Strategies)",
     blendedRows,
     "Profit",
-    blendedStartingEquity,
+    startingEquity,
     targetBetSize,
     startDateIso,
     resetEachYear
@@ -1654,6 +1655,7 @@ async function init() {
       sizingProfileSelect.value = currentSizingProfile;
       sizingProfileSelect.onchange = () => {
         currentSizingProfile = sizingProfileSelect.value;
+        currentInitialCapital = SIZING_DEFAULT_EQUITY[currentSizingProfile] || DEFAULT_STARTING_EQUITY;
         init();
       };
     }
