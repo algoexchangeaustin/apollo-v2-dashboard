@@ -603,6 +603,7 @@ function computeBacktestMetrics(
       return {
         date: rowDateIso(row),
         entryTs: parseUtcTimestamp(row["Entry time"] || row.entry_time_utc)?.getTime() || NaN,
+        exitTs: parseUtcTimestamp(row["Exit time"] || row.market_end_time_utc)?.getTime() || NaN,
         entryTime: formatTradeDateTime(row["Entry time"] || row.entry_time_utc),
         exitTime: formatTradeDateTime(row["Exit time"] || row.market_end_time_utc || row.entry_time_utc),
         market: formatSymbol(row),
@@ -1240,17 +1241,90 @@ function renderSummaryPanel(strategy) {
   setTextById("sumProfitFactor", fmtNumber(strategy.profitFactor, 2));
 }
 
+function consolidateOverlappingTrades(trades) {
+  if (!Array.isArray(trades) || trades.length === 0) return trades;
+  // Sort by entry timestamp ascending for overlap detection
+  const sorted = [...trades].filter(t => Number.isFinite(t.entryTs)).sort((a, b) => a.entryTs - b.entryTs);
+  const noTs = trades.filter(t => !Number.isFinite(t.entryTs));
+  const groups = [];
+  for (const trade of sorted) {
+    const key = `${trade.market}|${trade.direction}|${trade.date}`;
+    // Find existing group this trade overlaps with (entry before prior exit)
+    const existing = groups.find(g =>
+      g.key === key && Number.isFinite(g.maxExitTs) && trade.entryTs <= g.maxExitTs
+    );
+    if (existing) {
+      existing.trades.push(trade);
+      if (Number.isFinite(trade.exitTs) && trade.exitTs > existing.maxExitTs) {
+        existing.maxExitTs = trade.exitTs;
+      }
+    } else {
+      groups.push({
+        key,
+        trades: [trade],
+        maxExitTs: Number.isFinite(trade.exitTs) ? trade.exitTs : NaN
+      });
+    }
+  }
+  const consolidated = groups.map(g => {
+    if (g.trades.length === 1) return g.trades[0];
+    const t = g.trades;
+    const totalQty = t.reduce((s, tr) => s + (Number.isFinite(tr.qtyTraded) ? tr.qtyTraded : 0), 0);
+    // Weighted average entry price
+    let avgEntry = NaN;
+    if (totalQty > 0) {
+      avgEntry = t.reduce((s, tr) => {
+        const q = Number.isFinite(tr.qtyTraded) ? tr.qtyTraded : 0;
+        const p = Number.isFinite(tr.entryPrice) ? tr.entryPrice : 0;
+        return s + q * p;
+      }, 0) / totalQty;
+    }
+    // Weighted average exit price
+    let avgExit = NaN;
+    if (totalQty > 0) {
+      avgExit = t.reduce((s, tr) => {
+        const q = Number.isFinite(tr.qtyTraded) ? tr.qtyTraded : 0;
+        const p = Number.isFinite(tr.exitPrice) ? tr.exitPrice : 0;
+        return s + q * p;
+      }, 0) / totalQty;
+    }
+    const totalPnl = t.reduce((s, tr) => s + (Number.isFinite(tr.pnlUsd) ? tr.pnlUsd : 0), 0);
+    // Use earliest entry and latest exit
+    const earliest = t.reduce((min, tr) => tr.entryTs < min.entryTs ? tr : min, t[0]);
+    const latest = t.reduce((max, tr) => (Number.isFinite(tr.exitTs) && tr.exitTs > (max.exitTs || 0)) ? tr : max, t[0]);
+    return {
+      ...earliest,
+      qtyTraded: totalQty,
+      entryPrice: avgEntry,
+      exitPrice: avgExit,
+      exitTs: latest.exitTs,
+      exitTime: latest.exitTime,
+      pnlUsd: totalPnl,
+      result: totalPnl >= 0 ? "Win" : "Loss"
+    };
+  });
+  // Re-sort descending (most recent first) and append trades without timestamps
+  consolidated.sort((a, b) => {
+    const aTs = toNumber(a.entryTs);
+    const bTs = toNumber(b.entryTs);
+    if (Number.isFinite(aTs) && Number.isFinite(bTs) && aTs !== bTs) return bTs - aTs;
+    return String(b.date).localeCompare(String(a.date));
+  });
+  return [...consolidated, ...noTs];
+}
+
 function renderTradeLog(strategy) {
   const tbody = document.querySelector("#tradeLogTable tbody");
   if (!tbody) return;
   tbody.innerHTML = "";
 
-  const totalRows = strategy.tradeLog.length;
+  const consolidatedLog = consolidateOverlappingTrades(strategy.tradeLog);
+  const totalRows = consolidatedLog.length;
   const totalPages = Math.max(Math.ceil(totalRows / TRADE_LOG_PAGE_SIZE), 1);
   tradeLogCurrentPage = Math.min(Math.max(tradeLogCurrentPage, 1), totalPages);
   const start = (tradeLogCurrentPage - 1) * TRADE_LOG_PAGE_SIZE;
   const end = start + TRADE_LOG_PAGE_SIZE;
-  const rows = strategy.tradeLog.slice(start, end);
+  const rows = consolidatedLog.slice(start, end);
 
   rows.forEach((trade) => {
     const tr = document.createElement("tr");
